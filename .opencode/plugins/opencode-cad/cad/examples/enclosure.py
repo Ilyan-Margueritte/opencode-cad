@@ -1,4 +1,4 @@
-"""Two-part enclosure (base + lid) laid out for printing (patterns: hollow via outer.cut(inner), screw bosses, assembly)."""
+"""Two-part enclosure (base + lid) printed separately with a fit view: hollow via outer.cut(inner), screw bosses, printed lip (PARTS/ASSEMBLY contract)."""
 import cadquery as cq
 
 PARAMS = dict(
@@ -7,12 +7,14 @@ PARAMS = dict(
     corner_r=6.0,
     boss_d=8.0, screw_d=2.6, screw_clear=3.4,
     lid_t=2.4, lip_h=3.0, lip_wall=1.2, lip_clear=0.3,
-    gap=10.0,                                # spacing between the two printed parts
 )
 P = PARAMS
 
-# lid is placed beside the base: x spans [-50, 50] for the base and [60, 160] for the lid
-EXPECT = {"bbox": [210, 60, 35], "tol": 0.3, "solids": 2, "volume": 56000, "volume_tol_pct": 5}
+# Per-part checks (the printed lid is flipped: its height is lid_t + lip_h)
+PARTS_EXPECT = {
+    "base": {"bbox": [100, 60, 35], "tol": 0.3, "solids": 1},
+    "lid": {"bbox": [100, 60, 5.4], "tol": 0.3, "solids": 1},
+}
 
 
 def rounded_box(l, w, h, r):
@@ -82,15 +84,16 @@ def make_lid():
     return lid.cut(holes)
 
 
-base = make_base()
-# Flip the lid (plate on the print bed, lip up) and move it beside the base
-lid = (
-    make_lid()
-    .rotate((0, 0, 0), (1, 0, 0), 180)
-    .translate((P["length"] + P["gap"], 0, P["lid_t"]))
-)
+# Printed parts, each in its printing orientation: base as modelled, lid flipped
+# so its plate lies on the bed and the lip points up (no supports needed).
+PARTS = {
+    "base": make_base(),
+    "lid": make_lid().rotate((0, 0, 0), (1, 0, 0), 180).translate((0, 0, P["lid_t"])),
+}
 
-assy = cq.Assembly()
-assy.add(base, name="base", color=cq.Color("gray"))
-assy.add(lid, name="lid", color=cq.Color("lightblue"))
-result = assy
+# Assembled view: the closed lid sits on top of the base (lip inside the cavity)
+ASSEMBLY = (
+    cq.Assembly()
+    .add(make_base(), name="base", color=cq.Color("gray"))
+    .add(make_lid().translate((0, 0, P["height"])), name="lid", color=cq.Color("lightblue"))
+)

@@ -6,10 +6,10 @@ Plugin OpenCode (**API V2**) qui donne à un LLM (GLM, Qwen, DeepSeek, etc.) une
 
 | Élément | Rôle |
 |---|---|
-| `cad_run` | Exécute le script, valide la géométrie, compare à `EXPECT` (dimensions, volume, nombre de solides), exporte STEP + STL, rend des vues PNG et une coupe optionnelle |
+| `cad_run` | Exécute le script, valide la géométrie, compare à `EXPECT` / `PARTS_EXPECT`, refuse toute pièce plus grande que le plateau, exporte STEP + STL (un jeu par pièce), rend des vues PNG et une coupe optionnelle |
 | `cad_env` | Vérifie / installe Python + CadQuery dans un `.venv` local |
-| `cad_pitfalls` | Aide-mémoire des pièges CadQuery (plans, sélecteurs, congés, shell, révolution, booléens…), filtrable par sujet |
-| `cad_example` | 3 scripts de référence qui tournent : boîtier + couvercle, équerre avec trous, poulie révolutionnée |
+| `cad_pitfalls` | Aide-mémoire des pièges CadQuery (plans, sélecteurs, congés, shell, révolution, booléens, découpe d'impression…), filtrable par sujet |
+| `cad_example` | 3 scripts de référence qui tournent : boîtier 2 pièces (base + couvercle), équerre avec trous, poulie révolutionnée |
 | agent `cad` | Ingénieur CAO : spec, plan, construction incrémentale, vérification, livraison |
 | agent `cad-critic` | Sous-agent relecteur : rapport + vues + code, renvoie une liste de défauts avec corrections |
 
@@ -28,6 +28,9 @@ Plugin OpenCode (**API V2**) qui donne à un LLM (GLM, Qwen, DeepSeek, etc.) une
 └── agents/
     ├── cad.md
     └── cad-critic.md
+
+tests/
+└── test_cad_runner.py          tests de bout en bout du runner
 ```
 
 ## Installation
@@ -75,7 +78,7 @@ Exemple de prompt :
 
 > Conçois un boîtier 120×80×40 mm pour une carte ESP32 avec 4 bossages de vis M3, un couvercle à clipser, une ouverture USB-C sur un côté et des aérations. Pièces à plat pour l'impression.
 
-L'agent suit : **spec → pitfalls/exemples → script avec `PARAMS` et `EXPECT` → un ajout à la fois, `cad_run` après chacun → critique → livraison**. Les sorties sont dans `cad_out/<nom_du_script>/` : `model.step`, `model.stl`, `view_*.png`, `report.json`.
+L'agent suit : **spec (dimensions réelles sourcées) → pitfalls/exemples → script avec `PARAMS` et `EXPECT`/`PARTS` → un ajout à la fois, `cad_run` après chacun → critique → livraison**. Les sorties sont dans `cad_out/<nom_du_script>/` : `model[_<pièce>].step`/`.stl`, `view_*.png`, `report.json`.
 
 Choisis l'agent `cad` avec **Tab** dans l'interface.
 
@@ -89,8 +92,22 @@ EXPECT = {"bbox": [80, 40, 50], "tol": 0.5, "solids": 1}   # garde-fous optionne
 
 ...
 
-result = ma_piece                          # obligatoire
+result = ma_piece                          # pièce unique obligatoire
+
+# OU, pour plusieurs pièces à imprimer :
+PARTS = {"base": ma_base, "couvercle": mon_couvercle}   # chacune orientée pour l'impression, posée sur z=0
+PARTS_EXPECT = {"base": {"bbox": [...], "solids": 1}}   # garde-fous par pièce
+ASSEMBLY = cq.Assembly().add(...)          # optionnel : vue assemblée pour contrôler l'emboîtement
 ```
+
+## Impression : Creality K1 SE
+
+Le plugin connaît ton imprimante (volume 220 × 220 × 250 mm, buse 0,4 mm). À chaque `cad_run` :
+
+- toute pièce (le `result` ou chaque entrée de `PARTS`) qui dépasse le volume utile (215 × 215 × 245 mm, marge de 5 mm) est **refusée** : l'agent doit la découper en pièces imprimables avec joints d'alignement, jamais la réduire ;
+- un design qui doit s'ouvrir ou s'assembler est découpé en pièces (ex. boîtier → base + couvercle) modélisées chacune à plat, avec la vue assemblée et la coupe pour contrôler jeux et emboîtements.
+
+Autre imprimante : dans le script, `PRINTER = {"x": 350, "y": 350, "z": 300, "margin": 5}` (fusion partielle), ou `PRINT_CHECK = False` pour désactiver le contrôle.
 
 ## Utiliser un modèle avec vision pour la critique
 
@@ -102,6 +119,15 @@ model: fournisseur/modele-avec-vision
 
 Le critique lit alors les PNG ; sans vision il raisonne à partir des métriques et du code, ce qui attrape déjà beaucoup d'erreurs (pièces flottantes, mauvaise taille, volume incohérent).
 
+## Tests
+
+`tests/test_cad_runner.py` vérifie le runner de bout en bout (pièce simple, pièce trop grande refusée, multi-pièces avec exports séparés, assemblage + coupe + rendus, les 3 exemples) :
+
+```bash
+.venv/Scripts/python tests/test_cad_runner.py   # Windows
+.venv/bin/python tests/test_cad_runner.py       # macOS / Linux
+```
+
 ## Limites
 
 - Les rendus utilisent matplotlib (tri des faces approximatif sur les formes très complexes) : ils servent à vérifier l'allure et l'orientation, pas à faire du rendu photo. Pour un contrôle fin, ouvre le STEP dans FreeCAD ou ton slicer.
@@ -110,7 +136,7 @@ Le critique lit alors les PNG ; sans vision il raisonne à partir des métriques
 
 ## Faire évoluer la base de connaissances
 
-Chaque erreur récurrente d'un modèle doit finir dans `cad/pitfalls.md` (section `##` courte avec le piège et le bon motif), et chaque bonne solution dans `cad/examples/` (un script qui passe `cad_run` en `STATUS: OK`, première ligne de docstring = description). Modifie les fichiers **dans ce dépôt** (la source de vérité), puis recopie le dossier du plugin dans ton installation globale (voir la commande d'installation). C'est le levier qui rend un modèle open source de plus en plus fiable.
+Chaque erreur récurrente d'un modèle doit finir dans `cad/pitfalls.md` (section `##` courte avec le piège et le bon motif), et chaque bonne solution dans `cad/examples/` (un script qui passe `cad_run` en `STATUS: OK`, première ligne de docstring = description). Lance `tests/test_cad_runner.py` avant de copier le dossier du plugin dans ton installation globale (voir la commande d'installation). C'est le levier qui rend un modèle open source de plus en plus fiable.
 
 ---
 

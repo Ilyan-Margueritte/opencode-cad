@@ -2,7 +2,12 @@
 """Run a CadQuery script, validate the part, export STEP/STL and render PNG views.
 
 Contract for the user script:
-  - must define a variable `result` (cq.Workplane, cq.Assembly or cq.Shape)
+  - single part: define a variable `result` (cq.Workplane, cq.Assembly or cq.Shape)
+  - several printed parts: define `PARTS = {"name": shape, ...}` instead of `result`
+    (each part in its PRINTING orientation, on z=0), optional per-part checks
+    `PARTS_EXPECT = {"name": {... same keys as EXPECT ...}}`, and optional
+    `ASSEMBLY` (cq.Assembly, the same parts in assembled position: exported as
+    model_assembly.step, rendered as a fit view, target of --section)
   - may define `PARAMS` (dict, echoed in the report) and `EXPECT` (dict):
       EXPECT = {
           "bbox": [x, y, z],        # expected overall dimensions in mm
@@ -11,6 +16,10 @@ Contract for the user script:
           "volume_tol_pct": 5,      # tolerance on volume in %
           "solids": 1,              # expected number of solids
       }
+  - every printed part is checked against the printer bed (Creality K1 SE:
+    220 x 220 x 250 mm, default margin 5 mm). Override with
+    `PRINTER = {"x": ..., "y": ..., "z": ..., "margin": ...}` (partial merge)
+    or disable with `PRINT_CHECK = False`.
 
 Output: one JSON document on stdout (last line), also written to <out>/report.json
 """
@@ -33,6 +42,28 @@ VIEWS = {
     "bottom": (-90, -90),
 }
 
+DEFAULT_PRINTER = {"x": 220.0, "y": 220.0, "z": 250.0, "margin": 5.0}  # Creality K1 SE
+
+
+def sanitize(name):
+    """Part names become file names: keep letters, digits, dash and underscore."""
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(name))
+
+
+def usable_volume(printer):
+    margin = float(printer.get("margin", DEFAULT_PRINTER["margin"]))
+    return [float(printer.get(axis, DEFAULT_PRINTER[axis])) - margin for axis in ("x", "y", "z")]
+
+
+def check_print_volume(m, report, usable, prefix=""):
+    label = f"{usable[0]:g} x {usable[1]:g} x {usable[2]:g}"
+    for axis, value, limit in zip("XYZ", m["bbox_dims_mm"], usable):
+        if value > limit + 1e-6:
+            report["errors"].append(
+                f"{prefix}{axis} = {value:g} mm exceeds the usable print volume ({label} mm). "
+                "Split the part into printable pieces (PARTS) with alignment joints, or reduce/reorient it."
+            )
+
 
 def user_traceback(exc, script_path):
     """Keep only the frames from the user's script plus the error message."""
@@ -43,17 +74,17 @@ def user_traceback(exc, script_path):
     return head + msg
 
 
-def to_shape(obj, cq):
+def to_shape(obj, cq, name="result"):
     if isinstance(obj, cq.Workplane):
         shapes = [v for v in obj.vals() if isinstance(v, cq.Shape)]
         if not shapes:
-            raise ValueError("`result` is an empty Workplane (nothing on the stack).")
+            raise ValueError(f"`{name}` is an empty Workplane (nothing on the stack).")
         return shapes[0] if len(shapes) == 1 else cq.Compound.makeCompound(shapes)
     if isinstance(obj, cq.Assembly):
         return obj.toCompound()
     if isinstance(obj, cq.Shape):
         return obj
-    raise TypeError(f"`result` must be a Workplane, Assembly or Shape (got {type(obj).__name__}).")
+    raise TypeError(f"`{name}` must be a Workplane, Assembly or Shape (got {type(obj).__name__}).")
 
 
 def metrics(shape):
@@ -88,7 +119,7 @@ def solids_detail(shape, limit=20):
     return out
 
 
-def check_expect(m, expect, report):
+def check_expect(m, expect, report, prefix=""):
     if not expect:
         return
     tol = float(expect.get("tol", 0.5))
@@ -96,33 +127,33 @@ def check_expect(m, expect, report):
         for axis, e, g in zip("XYZ", expect["bbox"], m["bbox_dims_mm"]):
             if abs(e - g) > tol:
                 report["errors"].append(
-                    f"Size along {axis}: expected {e} mm, got {g} mm (tolerance {tol} mm)."
+                    prefix + f"Size along {axis}: expected {e} mm, got {g} mm (tolerance {tol} mm)."
                 )
     if "volume" in expect:
         pct = float(expect.get("volume_tol_pct", 5))
         e, g = float(expect["volume"]), m["volume_mm3"]
         if e > 0 and abs(g - e) / e * 100 > pct:
-            report["errors"].append(f"Volume: expected ~{e} mm3, got {g} mm3 (tolerance {pct}%).")
+            report["errors"].append(prefix + f"Volume: expected ~{e} mm3, got {g} mm3 (tolerance {pct}%).")
     if "solids" in expect and m["solids"] != int(expect["solids"]):
-        report["errors"].append(f"Solid count: expected {expect['solids']}, got {m['solids']}.")
+        report["errors"].append(prefix + f"Solid count: expected {expect['solids']}, got {m['solids']}.")
 
 
-def heuristics(m, expect, report):
+def heuristics(m, expect, report, prefix=""):
     if not m["valid"]:
         report["errors"].append(
-            "Invalid geometry (isValid() is False). Simplify booleans/fillets, avoid coplanar faces."
+            prefix + "Invalid geometry (isValid() is False). Simplify booleans/fillets, avoid coplanar faces."
         )
     if m["volume_mm3"] <= 0:
-        report["errors"].append("Volume is zero or negative: result is not a closed solid.")
+        report["errors"].append(prefix + "Volume is zero or negative: result is not a closed solid.")
     if m["solids"] > 1 and not (expect and "solids" in expect):
         report["warnings"].append(
-            f"{m['solids']} separate solids: disconnected parts? Make them overlap/touch, "
+            prefix + f"{m['solids']} separate solids: disconnected parts? Make them overlap/touch, "
             "or declare EXPECT['solids'] if intentional (assembly)."
         )
     if max(m["bbox_dims_mm"]) > 5000:
-        report["warnings"].append("Largest dimension > 5 m: possible unit mistake (CadQuery uses mm).")
+        report["warnings"].append(prefix + "Largest dimension > 5 m: possible unit mistake (CadQuery uses mm).")
     if min(m["bbox_dims_mm"]) < 0.1:
-        report["warnings"].append("A dimension is < 0.1 mm: flat part or possible unit mistake.")
+        report["warnings"].append(prefix + "A dimension is < 0.1 mm: flat part or possible unit mistake.")
 
 
 def make_section(shape, spec, cq):
@@ -202,6 +233,129 @@ def render(shape, out, names, suffix="", highlight=None):
     return files
 
 
+def make_exports(shape, cq, out, name=None, stl=True):
+    """Export one shape; returns the written file paths."""
+    w = cq.Workplane("XY").newObject([shape])
+    base = out / (f"model_{sanitize(name)}" if name else "model")
+    files = []
+    step = base.with_suffix(".step")
+    cq.exporters.export(w, str(step))
+    files.append(str(step))
+    if stl:
+        stl_path = base.with_suffix(".stl")
+        cq.exporters.export(w, str(stl_path), tolerance=0.05, angularTolerance=0.2)
+        files.append(str(stl_path))
+    return files
+
+
+def safe_render(shape, cq, out, view_names, suffix, section, report):
+    try:
+        files = render(shape, out, view_names, suffix=suffix)
+        if section:
+            cut, view, hl = make_section(shape, section, cq)
+            files += render(cut, out, [view, "iso"], suffix=f"{suffix} section {section}", highlight=hl)
+        return files
+    except ImportError:
+        report["warnings"].append("matplotlib/numpy missing: renders skipped (pip install matplotlib numpy).")
+        return []
+    except Exception as e:  # noqa: BLE001
+        report["warnings"].append(f"Render failed: {e}")
+        return []
+
+
+def run_single(ns, cq, report, out, a, expect_override, usable, print_check):
+    try:
+        shape = to_shape(ns["result"], cq)
+    except Exception as e:  # noqa: BLE001
+        report["errors"].append(str(e))
+        return
+
+    m = metrics(shape)
+    report["metrics"] = m
+    if m["solids"] > 1:
+        report["solids_detail"] = solids_detail(shape)
+
+    expect = dict(ns.get("EXPECT") or {})
+    expect.update(expect_override)
+    heuristics(m, expect, report)
+    check_expect(m, expect, report)
+    if print_check:
+        check_print_volume(m, report, usable)
+
+    try:
+        report["files"] += make_exports(shape, cq, out)
+    except Exception as e:  # noqa: BLE001
+        report["warnings"].append(f"Export failed: {e}")
+
+    if not a.no_render:
+        view_names = [v.strip() for v in a.views.split(",") if v.strip()]
+        report["files"] += safe_render(shape, cq, out, view_names, "", a.section, report)
+
+
+def run_multi(ns, cq, report, out, a, usable, print_check, parts):
+    if ns.get("EXPECT"):
+        report["warnings"].append(
+            "EXPECT is ignored in multi-part mode: use PARTS_EXPECT for per-part expectations."
+        )
+    if a.expect:
+        report["warnings"].append("--expect is ignored in multi-part mode: use PARTS_EXPECT.")
+
+    parts_expect = ns.get("PARTS_EXPECT") if isinstance(ns.get("PARTS_EXPECT"), dict) else {}
+    view_names = [v.strip() for v in a.views.split(",") if v.strip()]
+    report["parts"] = []
+
+    for name, obj in parts.items():
+        prefix = f"[{name}] "
+        try:
+            shape = to_shape(obj, cq, name=name)
+        except Exception as e:  # noqa: BLE001
+            report["errors"].append(prefix + str(e))
+            continue
+
+        m = metrics(shape)
+        entry = {"name": name, "metrics": m}
+        if m["solids"] > 1:
+            entry["solids_detail"] = solids_detail(shape)
+
+        exp = dict(parts_expect.get(name) or {})
+        heuristics(m, exp, report, prefix)
+        check_expect(m, exp, report, prefix)
+        if print_check:
+            check_print_volume(m, report, usable, prefix)
+
+        try:
+            files = make_exports(shape, cq, out, name=name)
+            entry["files"] = files
+            report["files"] += files
+        except Exception as e:  # noqa: BLE001
+            report["warnings"].append(f"{prefix}Export failed: {e}")
+
+        if not a.no_render:
+            files = safe_render(shape, cq, out, view_names, f" {name}", None, report)
+            entry["files"] = entry.get("files", []) + files
+            report["files"] += files
+
+        report["parts"].append(entry)
+
+    assy = ns.get("ASSEMBLY")
+    assy_shape = None
+    if assy is not None:
+        try:
+            assy_shape = to_shape(assy, cq, name="ASSEMBLY")
+            report["files"] += make_exports(assy_shape, cq, out, name="assembly", stl=False)
+        except Exception as e:  # noqa: BLE001
+            report["errors"].append("[ASSEMBLY] " + str(e))
+            assy_shape = None
+
+    if not a.no_render:
+        if assy_shape is not None:
+            report["files"] += safe_render(assy_shape, cq, out, view_names, " assembly", a.section, report)
+        elif a.section and assy is None:
+            report["warnings"].append(
+                "section is ignored in multi-part mode: define ASSEMBLY (cq.Assembly) to cut through."
+            )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("script")
@@ -243,49 +397,38 @@ def main():
         finish()
     report["script_stdout"] = buf.getvalue()[-2000:]
 
-    if "result" not in ns:
-        report["errors"].append("The script must define a variable `result` (Workplane, Assembly or Shape).")
-        finish()
-
-    try:
-        shape = to_shape(ns["result"], cq)
-    except Exception as e:  # noqa: BLE001
-        report["errors"].append(str(e))
-        finish()
-
-    m = metrics(shape)
-    report["metrics"] = m
-    if m["solids"] > 1:
-        report["solids_detail"] = solids_detail(shape)
-
-    expect = dict(ns.get("EXPECT") or {})
+    expect_override = {}
     if a.expect:
-        expect.update(json.loads(a.expect))
-    heuristics(m, expect, report)
-    check_expect(m, expect, report)
+        try:
+            expect_override = json.loads(a.expect)
+        except ValueError:
+            report["errors"].append(f"--expect is not valid JSON: {a.expect}")
+            finish()
+
+    printer = dict(DEFAULT_PRINTER)
+    if isinstance(ns.get("PRINTER"), dict):
+        printer.update(ns["PRINTER"])
+    print_check = ns.get("PRINT_CHECK", True) is not False
+    usable = usable_volume(printer)
+    report["printer"] = {**printer, "usable": usable, "check": print_check}
     if ns.get("PARAMS"):
         report["params"] = ns["PARAMS"]
 
-    try:
-        w = cq.Workplane("XY").newObject([shape])
-        step, stl = out / "model.step", out / "model.stl"
-        cq.exporters.export(w, str(step))
-        cq.exporters.export(w, str(stl), tolerance=0.05, angularTolerance=0.2)
-        report["files"] += [str(step), str(stl)]
-    except Exception as e:  # noqa: BLE001
-        report["warnings"].append(f"Export failed: {e}")
-
-    if not a.no_render:
-        try:
-            names = [v.strip() for v in a.views.split(",") if v.strip()]
-            report["files"] += render(shape, out, names)
-            if a.section:
-                cut, view, hl = make_section(shape, a.section, cq)
-                report["files"] += render(cut, out, [view, "iso"], suffix=f" section {a.section}", highlight=hl)
-        except ImportError:
-            report["warnings"].append("matplotlib/numpy missing: renders skipped (pip install matplotlib numpy).")
-        except Exception as e:  # noqa: BLE001
-            report["warnings"].append(f"Render failed: {e}")
+    parts = ns.get("PARTS")
+    if "result" in ns:
+        if parts:
+            report["warnings"].append(
+                "PARTS is ignored because `result` is also defined: remove `result` to use the multi-part mode."
+            )
+        run_single(ns, cq, report, out, a, expect_override, usable, print_check)
+    elif isinstance(parts, dict) and parts:
+        run_multi(ns, cq, report, out, a, usable, print_check, parts)
+    elif parts is not None:
+        report["errors"].append("PARTS must be a dict {name: Workplane|Assembly|Shape}.")
+    else:
+        report["errors"].append(
+            "The script must define `result` (single part) or `PARTS` (dict of printed parts)."
+        )
 
     finish()
 

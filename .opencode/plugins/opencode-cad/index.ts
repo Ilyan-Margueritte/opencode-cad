@@ -63,6 +63,7 @@ function formatReport(rep: any, outDir: string, root: string): string {
   const rel = (p: string) => path.relative(root, p) || p
   const L: string[] = []
   L.push(rep.ok ? "STATUS: OK" : "STATUS: FAILED")
+  if (rep.printer?.check === false) L.push("(note: PRINT_CHECK is disabled in this script: the printer bed is not enforced)")
 
   if (rep.errors?.length) {
     L.push("", "ERRORS (fix these first):")
@@ -84,6 +85,15 @@ function formatReport(rep: any, outDir: string, root: string): string {
       `- bbox min: ${m.bbox_min.join(", ")}   bbox max: ${m.bbox_max.join(", ")}`,
       `- center of mass: ${m.center.join(", ")}`,
     )
+  }
+  if (rep.parts?.length) {
+    L.push("", "PARTS (each exported separately):")
+    for (const p of rep.parts) {
+      const pm = p.metrics ?? {}
+      L.push(
+        `- ${p.name}: ${pm.solids} solid(s), volume ${pm.volume_mm3} mm3, bbox size (X x Y x Z): ${(pm.bbox_dims_mm ?? []).join(" x ")} mm`,
+      )
+    }
   }
   if (rep.solids_detail?.length) {
     L.push("", "SOLIDS:")
@@ -116,8 +126,9 @@ export default {
       editor.add({
         name: "cad_run",
         description:
-          "Execute a CadQuery script (it must define a variable `result`), validate the geometry, check optional expectations, " +
-          "export STEP/STL and render PNG views. ALWAYS call this after every change to the script. " +
+          "Execute a CadQuery script (define `result` for a single part, or `PARTS` = {name: shape} for several printed parts plus optional `ASSEMBLY`), " +
+          "validate the geometry, check optional expectations (EXPECT, or PARTS_EXPECT per part), enforce the printer bed (Creality K1 SE: 220 x 220 x 250 mm, 5 mm margin), " +
+          "export STEP/STL (one set per part) and render PNG views. ALWAYS call this after every change to the script. " +
           "Returns a precise report: errors (with a trimmed traceback), warnings, volume, bounding box, solid count and output files.",
         input: {
           type: "object",
@@ -125,11 +136,11 @@ export default {
             script: { type: "string", description: "Path to the .py CadQuery script, relative to the project root" },
             expect: {
               type: "string",
-              description: 'Optional JSON overriding EXPECT in the script, e.g. {"bbox":[80,40,50],"tol":0.5,"solids":1}',
+              description: 'Optional JSON overriding EXPECT in the script, e.g. {"bbox":[80,40,50],"tol":0.5,"solids":1}. Ignored in multi-part scripts: use PARTS_EXPECT.',
             },
             section: {
               type: "string",
-              description: "Optional cross-section as 'axis:offset' (e.g. 'z:10', 'y:0'). Useful to inspect hollow parts.",
+              description: "Optional cross-section as 'axis:offset' (e.g. 'z:10', 'y:0'). Cuts the part, or the ASSEMBLY in multi-part scripts. Useful to inspect hollow parts and fits.",
             },
             views: {
               type: "string",
@@ -289,7 +300,7 @@ export default {
       editor.add({
         name: "cad_example",
         description:
-          "List or read working CadQuery example scripts (enclosure with lid, bracket with hole patterns, revolved pulley). " +
+          "List or read working CadQuery example scripts (two-part enclosure with assembly view, bracket with hole patterns, revolved pulley). " +
           "Call with no arguments to list them, or with a name to read the source and copy its patterns.",
         input: {
           type: "object",

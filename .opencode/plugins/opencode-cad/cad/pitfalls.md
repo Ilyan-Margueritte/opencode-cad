@@ -1,8 +1,11 @@
 # CadQuery pitfalls and robust patterns (CadQuery 2.x, units = millimetres)
 
 ## Script contract
-- The script must define `result` (a `cq.Workplane`, `cq.Assembly` or `cq.Shape`). `cad_run` exports STEP/STL and renders views for you.
-- Put every dimension in a `PARAMS` dict at the top. Put sanity checks in `EXPECT = {"bbox": [x, y, z], "tol": 0.5, "solids": 1, "volume": V, "volume_tol_pct": 5}`.
+- SINGLE printed part: define `result` (a `cq.Workplane`, `cq.Assembly` or `cq.Shape`). `cad_run` exports `model.step`/`model.stl`, renders views and checks `EXPECT`.
+- SEVERAL printed parts (a design that opens, or a piece split to fit the bed): define `PARTS = {"base": wp, "lid": wp}` instead of `result`. Each part is validated and exported on its own (`model_<name>.step/.stl`) against `PARTS_EXPECT = {"base": {... same keys as EXPECT ...}}`. Model every part in its PRINTING orientation, sitting on z=0 — never lay the parts out side by side.
+- Optional `ASSEMBLY = cq.Assembly()` (the same parts in assembled position) exports `model_assembly.step`, renders a fit view and is what `--section` cuts through. The assembly size is NOT checked against the bed: the assembled object may legitimately exceed it.
+- Put every dimension in a `PARAMS` dict at the top, shared by all parts. Put sanity checks in `EXPECT = {"bbox": [x, y, z], "tol": 0.5, "solids": 1, "volume": V, "volume_tol_pct": 5}` (single) or `PARTS_EXPECT` (multi).
+- `cad_run` checks every printed part against the printer bed (Creality K1 SE: 220 x 220 x 250 mm, default margin 5 mm). Override with `PRINTER = {"x": ..., "y": ..., "z": ..., "margin": ...}` (partial dict, merges with defaults) or disable with `PRINT_CHECK = False`.
 - Do NOT call `show_object`, `cq.exporters.export`, `input()`, or open any GUI. Use `print()` freely: output appears in the report.
 - Convention unless told otherwise: Z is up, the part sits on z=0, centred on X/Y.
 
@@ -80,10 +83,11 @@ def safe_fillet(wp, selector, r):
 - `pushPoints([(x, y), ...])` for arbitrary positions.
 - `mirror("YZ")` mirrors about the YZ plane (union with the original by default). `rotate((0,0,0), (0,0,1), angle_deg)` rotates about an axis given by two points.
 
-## Assemblies
-- Simplest: position parts with `.translate((x, y, z))` / `.rotate(...)` and combine with `cq.Assembly().add(part, name="a", color=cq.Color("gray"))`. Assign `result = assy`.
-- Declare `EXPECT["solids"] = N` for assemblies, otherwise `cad_run` warns about several solids.
-- Parts that must be ONE printed body need to overlap, then `union`.
+## Assemblies and multi-part designs
+- Write one `make_<part>(P)` function per physical part, built in ASSEMBLED coordinates from the shared `PARAMS`. `PARTS` gets the printed copies (derive each one from the assembled one: rotate it to print flat, translate it to rest on z=0). `ASSEMBLY` gets the assembled copies: `cq.Assembly().add(make_base(P), name="base", color=cq.Color("gray"))`.
+- Debug the fit in `ASSEMBLY` first, then export: `cad_run section="z:<height>"` cuts through the assembly so clearances and inserts are visible.
+- Display-only assembly (`result = assy`): position parts with `.translate`/`.rotate`; declare `EXPECT["solids"] = N` or `cad_run` warns about several solids.
+- Parts that must be ONE printed body need to overlap by 0.1-1 mm, then `union`.
 
 ## Things not to attempt from scratch
 - Real screw threads (use a plain cylinder at the nominal/minor diameter), involute gears (use the `cq_gears` package if installed; otherwise a clearly approximated tooth profile), text with exotic fonts, organic/freeform surfaces.
@@ -108,3 +112,12 @@ def safe_fillet(wp, selector, r):
 - Clearance for sliding/press fits 0.2-0.4 mm per side. Printed holes: add 0.2 mm to the diameter.
 - M3: clearance hole 3.4 mm, pilot hole in plastic 2.6 mm, heat-set insert hole about 4.2 mm, counterbore 6.2 mm x 3 mm.
 - Keep overhangs at 45 degrees or less, or orient the part so the large flat face is on z=0.
+
+## Printer: Creality K1 SE (the user's printer)
+- Build volume 220 x 220 x 250 mm, nozzle 0.4 mm. `cad_run` applies a 5 mm margin (usable 215 x 215 x 245) and FAILS any printed part that exceeds it.
+- A part that does not fit is SPLIT into pieces that do — never scaled down. Cut away from functional features (holes, seats, mating faces) and put the seam on a flat, easy-to-glue surface.
+- Glued split joints:
+  - Flat seam + 2-4 alignment pins: pin Ø4-6 mm, socket +0.2 mm clearance, pin length >= 2x its diameter.
+  - Dovetail / T-slot when the seam takes load: 0.2 mm clearance per side, 45-60 degree flanks.
+  - Keep full wall thickness at the seam; a glued seam must not be a 0.4 mm skin.
+- A design that opens or assembles: give the moving part 0.2-0.3 mm clearance on its sliding faces and a register/lip at least 5 mm long.
