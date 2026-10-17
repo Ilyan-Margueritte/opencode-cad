@@ -1,0 +1,12 @@
+{
+  "name": "opencode-cad",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "CAD engineering loop for OpenCode: write parametric CadQuery, run it, read a precise report, fix. Tools: cad_run, cad_env, cad_pitfalls, cad_example",
+  "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts",
+    "./server": "./index.ts"
+  }
+}
